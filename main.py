@@ -11,7 +11,7 @@
 - 구분1마다 같은 약 7,969명을 서로 다른 기준으로 나눈 것이므로 집단끼리 겹침
 - 이용시간대 5개 열의 합 = 100%, 콘텐츠 이용 빈도 7개 열의 합 = 100%
 
-실행 방법:  streamlit run main.py
+실행 방법:  같은 폴더에 데이터 CSV를 두고  streamlit run main.py
 """
 
 import io
@@ -32,7 +32,7 @@ from sklearn.preprocessing import StandardScaler
 # ----------------------------------------------------------------------------
 # 상수 (실제 CSV의 열 이름)
 # ----------------------------------------------------------------------------
-DEFAULT_FILE = "스마트폰_이용행태_조사_2025.csv"
+DATA_FILE = "스마트폰_이용행태_조사_2025_전처리완료.csv"  # main.py와 같은 폴더에 둘 것
 ENCODINGS = ["utf-8-sig", "cp949", "euc-kr", "utf-16"]
 
 COL_G1 = "구분1"
@@ -247,30 +247,29 @@ def split_total(df, g1, g2):
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="스마트폰 이용행태 분석", layout="wide")
 st.title("스마트폰 이용행태 조사 2025 - 데이터 분석")
-st.caption("CSV 파일을 올리면 데이터를 자동으로 정리하고, 5가지 탐구 질문에 답하는 그래프와 해석을 보여 줍니다.")
+st.caption("조사 자료를 자동으로 정리하고, 5가지 탐구 질문에 답하는 그래프와 해석을 보여 줍니다.")
 
-st.sidebar.header("1. 데이터 불러오기")
-uploaded = st.sidebar.file_uploader("CSV 파일 업로드", type=["csv"])
-file_bytes = None
-source_name = None
-if uploaded is not None:
-    file_bytes = uploaded.getvalue()
-    source_name = uploaded.name
-elif os.path.exists(DEFAULT_FILE):
-    if st.sidebar.checkbox(f"같은 폴더의 '{DEFAULT_FILE}' 사용", value=False):
-        with open(DEFAULT_FILE, "rb") as f:
-            file_bytes = f.read()
-        source_name = DEFAULT_FILE
+def find_data_file():
+    """main.py와 같은 폴더(없으면 현재 실행 폴더)에서 데이터 파일 찾기"""
+    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    for folder in (here, os.getcwd()):
+        path = os.path.join(folder, DATA_FILE)
+        if os.path.exists(path):
+            return path
+    return None
 
-if file_bytes is None:
-    st.info("왼쪽 사이드바에서 **스마트폰 이용행태 조사 CSV 파일**을 올려 주세요.")
-    st.markdown(
-        "**이 자료는 이렇게 생겼어요**\n\n"
-        "- 한 행은 사람 한 명이 아니라 **'10대', '여자', '사무직'처럼 한 집단의 통계**입니다.\n"
-        "- 열에는 하루 평균 이용 시간, 이용 시간대별 비율, OTT·뉴스·SNS 이용 빈도 비율 등이 들어 있습니다.\n"
-        "- 따라서 이 앱의 분석은 개인이 아니라 **집단 단위**의 경향을 살펴보는 것입니다."
-    )
+
+data_path = find_data_file()
+if data_path is None:
+    st.error(f"데이터 파일 '{DATA_FILE}'을(를) 찾을 수 없습니다. main.py와 같은 폴더에 이 파일을 넣고 다시 실행해 주세요.")
     st.stop()
+try:
+    with open(data_path, "rb") as f:
+        file_bytes = f.read()
+except OSError as e:
+    st.error(f"데이터 파일을 여는 중 문제가 생겼습니다: {e}")
+    st.stop()
+source_name = DATA_FILE
 
 try:
     raw_df, clean_df, log = load_and_clean(file_bytes)
@@ -311,7 +310,7 @@ for p in CONTENTS:
         FREQ_COLS[p] = items
 
 # 사이드바 옵션
-st.sidebar.header("2. 분석 범위")
+st.sidebar.header("분석 설정")
 scope = st.sidebar.selectbox(
     "2번·3번 질문에서 사용할 집단",
     ["모든 집단 (총인원 제외)"] + dims,
