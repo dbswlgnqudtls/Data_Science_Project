@@ -23,11 +23,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import stats
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
 # ----------------------------------------------------------------------------
 # 상수 (실제 CSV의 열 이름)
@@ -61,7 +56,6 @@ FREQ_DAYS = {"매일": 7.0, "주 5-6일": 5.5, "주 3-4일": 3.5, "주 1-2일": 
 TOTAL_WORDS = {"총인원", "전체", "합계", "총계", "계", "전체응답", "전체 응답"}
 CORE_DIMS = ["성별", "연령", "직업", "학력"]
 ORDINAL_KEYWORDS = ["연령", "소득"]  # 순서가 분명한 변수만 순위상관 허용
-MIN_ROWS_FOR_MODEL = 30  # 이보다 집단 수가 적으면 회귀 모델을 만들지 않음
 
 
 # ----------------------------------------------------------------------------
@@ -327,7 +321,7 @@ st.sidebar.markdown("---")
 st.sidebar.caption(f"불러온 파일: {source_name} (인코딩: {log['encoding']})")
 
 tabs = st.tabs(["데이터 확인", "1. 연령대별 이용 시간", "2. 이용 시간대 비율", "3. 콘텐츠 이용 빈도",
-                "4. 집단 특성 비교", "5. 예측 모델", "다운로드"])
+                "4. 집단 특성 비교", "다운로드"])
 
 # ============================================================================
 # 탭 0: 데이터 확인
@@ -733,223 +727,9 @@ with tabs[4]:
                 interpret(msg + ["순위상관은 '순서대로 갈수록 한 방향으로 변하는가'를 보는 값이라, 중간에 오르내림이 있으면 값이 작아질 수 있습니다."])
 
 # ============================================================================
-# 탭 5: 예측 모델
+# 탭 5: 다운로드
 # ============================================================================
 with tabs[5]:
-    st.header("질문 5. 집단별 평균 스마트폰 이용 시간을 예측하는 회귀 모델을 만들 수 있을까?")
-    st.warning("이 분석은 **개인의 이용 시간을 맞히는 것이 아니라**, 집단별 평균 이용 시간에 대한 **탐색적 예측**입니다.")
-
-    # --- 타당성 점검 ---
-    dim_info = analysis.groupby(G1, sort=False).agg(집단수=(G2, "count"))
-    if NCOL:
-        dim_info["사례수합"] = analysis.groupby(G1, sort=False)[NCOL].sum()
-    n_dims = len(dim_info)
-    max_rows = int(dim_info["집단수"].max())
-    best_dim = dim_info["집단수"].idxmax()
-
-    overlap = False
-    if NCOL and n_dims >= 2:
-        sums = dim_info["사례수합"]
-        ref = float(sums.median())
-        overlap = bool((sums.sub(ref).abs() / ref <= 0.05).sum() >= 2)
-    n_feat_pool = len([c for c in cols if "퍼센트" in c])
-
-    checks = pd.DataFrame([
-        {"점검 항목": "서로 다른 집계 기준을 하나의 표본으로 합쳐도 되는가?",
-         "결과": "합칠 수 없음" if overlap or n_dims >= 2 else "해당 없음",
-         "설명": (f"구분1이 {n_dims}종이고, 각 기준의 사례수 합계가 거의 같음 → 같은 응답자를 여러 방식으로 나눈 자료라 "
-                  "합치면 같은 사람이 중복으로 계산됨") if overlap else
-                 (f"구분1이 {n_dims}종으로 집계 단위가 서로 다름" if n_dims >= 2 else "집계 기준이 하나뿐임")},
-        {"점검 항목": f"한 가지 집계 기준 안의 집단 수가 {MIN_ROWS_FOR_MODEL}개 이상인가?",
-         "결과": "통과" if max_rows >= MIN_ROWS_FOR_MODEL else "부족",
-         "설명": f"가장 많은 기준은 '{best_dim}'로 {max_rows}개 집단"},
-        {"점검 항목": "집단 수에 비해 설명 변수(열)가 지나치게 많지 않은가?",
-         "결과": "통과" if max_rows >= 5 * 5 else "부족",
-         "설명": f"퍼센트 열이 {n_feat_pool}개인데 집단은 최대 {max_rows}개 → 변수 수가 표본 수보다 많거나 비슷함"},
-    ])
-    show_df(checks)
-
-    candidates = [d for d in dims if int(dim_info.loc[d, "집단수"]) >= MIN_ROWS_FOR_MODEL]
-
-    if not candidates:
-        st.error("**이 자료로는 회귀 모델을 만들지 않았습니다.**")
-        interpret([
-            "**왜 만들지 않았나요?**",
-            f"1) 이 자료의 54행은 '성별', '연령', '직업' 등 **서로 다른 기준으로 나눈 집계 결과**이고, 기준마다 같은 응답자(약 "
-            f"{int(dim_info['사례수합'].median()) if NCOL else '약 8천'}명)를 다시 나눈 것입니다. 이를 하나의 표로 합치면 같은 사람이 "
-            "여러 번 들어가 학습 데이터와 테스트 데이터가 서로 섞이고(정보 누출), 성능이 실제보다 좋게 보입니다.",
-            f"2) 한 가지 기준 안에서만 보면 집단이 최대 {max_rows}개({best_dim})뿐입니다. 학습용과 테스트용으로 나누면 "
-            "몇 개 안 되는 점으로 모델을 만들고 검증하게 되어 결과가 매우 불안정합니다.",
-            "3) 설명 변수로 쓸 수 있는 퍼센트 열은 수십 개인데 집단은 훨씬 적어, 모델이 우연한 패턴을 외워 버리는 과적합 위험이 큽니다. "
-            "또 이용 시간대 비율은 평균 이용 시간을 거의 그대로 계산할 수 있는 값이라 '예측'이 아니라 '순환 논리'가 됩니다.",
-            "**대신 할 수 있는 것**: 집단별 평균을 비교하고 상관관계를 살펴보는 **기술 분석**은 타당합니다. 아래에서 확인해 보세요.",
-            "**모델을 만들려면**: ① 개인 단위 응답 자료, 또는 ② 같은 기준·같은 모집단으로 집계된 집단이 최소 "
-            f"{MIN_ROWS_FOR_MODEL}개 이상인 자료가 필요합니다.",
-        ])
-    else:
-        st.success(f"집단이 {MIN_ROWS_FOR_MODEL}개 이상인 집계 기준이 있어 탐색용 모델을 만들 수 있습니다. "
-                   "(한 가지 기준의 집단만 사용하며, 다른 기준의 행과 섞지 않습니다.)")
-        mdim = st.selectbox("모델에 사용할 집계 기준", candidates)
-        mdf = analysis[analysis[G1] == mdim].copy()
-        time_cols = {c for c, _, _ in TIME_AVAILABLE}
-        feat_options = [c for c in mdf.columns if pd.api.types.is_numeric_dtype(mdf[c]) and c not in time_cols
-                        and c not in {AVG, NCOL, "집단"}]
-        default_feats = [c for c in feat_options if c.startswith(tuple(CONTENTS + ["TV시청"])) and "매일" in c]
-        if USE and USE in feat_options:
-            default_feats.append(USE)
-        feats = st.multiselect("설명 변수 (이용 시간대 비율은 평균 이용 시간과 거의 같은 정보라 제외했습니다)",
-                               feat_options, default=default_feats)
-        test_size = st.slider("테스트 데이터 비율", 0.2, 0.4, 0.25, 0.05)
-        alpha = st.select_slider("규제 강도 (클수록 모델이 단순해집니다)", options=[0.1, 1.0, 3.0, 10.0], value=1.0)
-
-        if not feats:
-            st.warning("설명 변수를 하나 이상 선택해 주세요.")
-        else:
-            data = mdf[feats + [AVG, "집단"]].dropna()
-            n_total = len(data)
-            n_test = max(int(round(n_total * test_size)), 2)
-            n_train = n_total - n_test
-            if n_train < 3 * len(feats) or n_train < 10:
-                st.error(f"결측치를 제외하고 {n_total}개 집단이 남아, 변수 {len(feats)}개로 학습하기엔 데이터가 부족합니다. 변수를 줄여 주세요.")
-            else:
-                try:
-                    Xtr, Xte, ytr, yte, ntr, nte = train_test_split(
-                        data[feats], data[AVG], data["집단"], test_size=n_test, random_state=42)
-                    model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
-                    model.fit(Xtr, ytr)
-                    pred_te, pred_tr = model.predict(Xte), model.predict(Xtr)
-                    r2_te, r2_tr = r2_score(yte, pred_te), r2_score(ytr, pred_tr)
-                    mae = mean_absolute_error(yte, pred_te)
-                    rmse = float(np.sqrt(mean_squared_error(yte, pred_te)))
-
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("테스트 R²", f"{r2_te:.3f}")
-                    m2.metric("학습 R²", f"{r2_tr:.3f}")
-                    m3.metric("테스트 MAE(분)", f"{mae:.1f}")
-                    m4.metric("테스트 RMSE(분)", f"{rmse:.1f}")
-
-                    res_df = pd.DataFrame({"집단": nte.values, "실제값": yte.values, "예측값": pred_te})
-                    fig = px.scatter(res_df, x="실제값", y="예측값", hover_name="집단",
-                                     labels={"실제값": "실제 평균 이용 시간(분)", "예측값": "예측 평균 이용 시간(분)"},
-                                     title="테스트 데이터: 실제값 vs 예측값")
-                    lo_v, hi_v = float(min(res_df.min(numeric_only=True))), float(max(res_df.max(numeric_only=True)))
-                    fig.add_trace(go.Scatter(x=[lo_v, hi_v], y=[lo_v, hi_v], mode="lines", name="완벽한 예측(y=x)",
-                                             line=dict(dash="dash", color="gray")))
-                    show_fig(fig)
-
-                    coef = pd.DataFrame({"변수": feats, "표준화 계수": model[-1].coef_}).sort_values("표준화 계수")
-                    fig2 = px.bar(coef, x="표준화 계수", y="변수", orientation="h", title="변수별 영향 방향과 크기(표준화)")
-                    show_fig(fig2)
-
-                    if r2_te >= 0.7:
-                        quality = "테스트 데이터에서 변화를 꽤 잘 설명합니다."
-                    elif r2_te >= 0.3:
-                        quality = "일부만 설명하며, 예측력은 보통 수준입니다."
-                    elif r2_te >= 0:
-                        quality = "설명력이 낮습니다."
-                    else:
-                        quality = "단순히 평균값으로 예측하는 것보다도 못합니다."
-                    interpret([
-                        f"테스트 R² = {r2_te:.2f}: 집단별 평균 이용 시간의 차이 중 약 {max(r2_te, 0) * 100:.0f}%를 설명합니다. {quality}",
-                        f"MAE = {mae:.1f}분: 예측이 실제 집단 평균에서 평균적으로 약 {mae:.1f}분 벗어납니다.",
-                        f"학습 R²({r2_tr:.2f})가 테스트 R²({r2_te:.2f})보다 훨씬 높다면 과적합 신호입니다. "
-                        f"사용한 집단은 '{mdim}' 기준 {n_total}개(학습 {len(Xtr)}·테스트 {len(Xte)})뿐이라 결과는 우연에 크게 좌우될 수 있습니다.",
-                        "이 모델은 **집단 평균에 대한 탐색적 예측**이며, 한 사람의 스마트폰 이용 시간을 예측하는 모델이 아닙니다.",
-                    ])
-                except Exception as e:
-                    st.error(f"모델을 만드는 중 문제가 발생했습니다: {e}")
-
-    # --- 모델 대신 하는 기술 분석 ---
-    st.markdown("---")
-    st.subheader("기술 분석: 집단별 평균 비교와 상관관계")
-    st.markdown(
-        "예측 모델 대신, 집단들의 **평균 이용 시간이 어떤 특징과 함께 움직이는지**를 살펴봅니다. "
-        "이것은 미래나 개인을 예측하는 것이 아니라, 이 자료에 나타난 집단 간 **경향을 설명**하는 분석입니다."
-    )
-
-    def short_name(c):
-        return c.replace(" (퍼센트)", "").replace(" (분)", "").replace(" (명)", "")
-
-    use_time_cols = st.checkbox("이용 시간대 비율도 포함하기 (평균 이용 시간과 거의 같은 정보라 기본은 제외)", value=False, key="q5_time")
-    time_set = {c for c, _, _ in TIME_AVAILABLE}
-    skip = {AVG, NCOL, "집단"} | (set() if use_time_cols else time_set)
-    var_cols = [c for c in analysis.columns if pd.api.types.is_numeric_dtype(analysis[c]) and c not in skip]
-
-    rows = []
-    for c in var_cols:
-        r = safe_corr(analysis[c], analysis[AVG])
-        if r:
-            rows.append({"변수": short_name(c), "열": c, "피어슨 r": r["pearson"], "스피어만 ρ": r["spearman"], "집단 수": r["n"]})
-
-    if not rows:
-        st.warning("상관관계를 계산할 수 있는 변수가 없습니다.")
-    else:
-        cdf = pd.DataFrame(rows)
-        cdf["강도"] = cdf["피어슨 r"].abs()
-        cdf = cdf.sort_values("강도", ascending=False).reset_index(drop=True)
-        top_n = cdf.head(12).sort_values("피어슨 r")
-        top_n["방향"] = np.where(top_n["피어슨 r"] >= 0, "양(+)의 관계", "음(-)의 관계")
-        fig = px.bar(top_n, x="피어슨 r", y="변수", orientation="h", color="방향",
-                     text=top_n["피어슨 r"].round(2),
-                     labels={"피어슨 r": "평균 이용 시간과의 상관계수 (-1 ~ +1)"},
-                     title="평균 이용 시간과 관계가 큰 변수 (상위 12개)")
-        fig.update_traces(textposition="outside")
-        fig.update_xaxes(range=[-1.15, 1.15])
-        show_fig(fig)
-
-        pos = cdf[cdf["피어슨 r"] > 0].head(3)
-        neg = cdf[cdf["피어슨 r"] < 0].head(3)
-        lines = [f"전체 {len(analysis)}개 집단을 놓고, 각 변수가 높은 집단일수록 평균 이용 시간이 길어지는지(+) 짧아지는지(-)를 계산했습니다."]
-        if len(pos):
-            lines.append("평균 이용 시간이 **긴 집단일수록 높게 나타나는** 특징: " +
-                         ", ".join(f"{r['변수']}(r={r['피어슨 r']:.2f})" for _, r in pos.iterrows()))
-        if len(neg):
-            lines.append("평균 이용 시간이 **긴 집단일수록 낮게 나타나는** 특징: " +
-                         ", ".join(f"{r['변수']}(r={r['피어슨 r']:.2f})" for _, r in neg.iterrows()))
-        lines.append("상관관계는 '함께 변하는 정도'일 뿐 원인을 뜻하지 않습니다. 또 연령·직업·학력 집단은 서로 겹치는 사람들을 포함하므로, "
-                     "숫자는 정확한 값이 아니라 **경향을 보는 참고용**입니다. (젊은 집단이 여러 활동을 많이 하면서 이용 시간도 길어서, "
-                     "'연령'이라는 공통 요인이 여러 변수를 함께 움직였을 가능성이 큽니다.)")
-        interpret(lines)
-
-        show_df(cdf[["변수", "피어슨 r", "스피어만 ρ", "집단 수"]].round(3))
-
-        st.markdown("**변수를 골라 산점도로 보기**")
-        names = list(cdf["변수"])
-        pick_name = st.selectbox("변수 선택", names, index=0, key="q5_var")
-        pick_col = cdf.loc[cdf["변수"] == pick_name, "열"].iloc[0]
-        fig = px.scatter(analysis, x=pick_col, y=AVG, hover_name="집단", color=G1,
-                         labels={pick_col: pick_name, AVG: "하루 평균 이용 시간(분)", G1: "집계 기준"},
-                         title=f"{pick_name} vs 평균 이용 시간")
-        add_fit_line(fig, analysis[pick_col], analysis[AVG])
-        show_fig(fig)
-        rr = safe_corr(analysis[pick_col], analysis[AVG])
-        if rr:
-            way = "길어지는" if rr["pearson"] > 0 else "짧아지는"
-            interpret(f"'{pick_name}' 값이 큰 집단일수록 평균 이용 시간이 {way} 경향이 있으며, "
-                      f"피어슨 r = {rr['pearson']:.2f}, 스피어만 ρ = {rr['spearman']:.2f}로 {corr_strength(rr['pearson'])} 관계입니다.")
-
-    st.markdown("**평균 이용 시간이 가장 긴 집단과 가장 짧은 집단**")
-    k = min(8, len(analysis) // 2)
-    if k >= 1:
-        ranked = analysis.sort_values(AVG, ascending=False)
-        top_g, bot_g = ranked.head(k).copy(), ranked.tail(k).copy()
-        top_g["구분"], bot_g["구분"] = "긴 집단", "짧은 집단"
-        both = pd.concat([top_g, bot_g])
-        fig = px.bar(both, x=AVG, y="집단", orientation="h", color="구분", text=both[AVG].round(1),
-                     category_orders={"집단": list(both["집단"])},
-                     labels={AVG: "하루 평균 이용 시간(분)"}, title=f"평균 이용 시간 상위 {k}개와 하위 {k}개 집단")
-        fig.update_traces(textposition="outside")
-        fig.update_yaxes(autorange="reversed")
-        show_fig(fig)
-        t1, b1 = ranked.iloc[0], ranked.iloc[-1]
-        interpret([f"가장 긴 집단은 **{t1['집단']}**({fmt_min(t1[AVG])}), 가장 짧은 집단은 **{b1['집단']}**({fmt_min(b1[AVG])})이고 "
-                   f"차이는 {t1[AVG] - b1[AVG]:.1f}분입니다.",
-                   "상위·하위에 어떤 집단이 모이는지 보면, 평균 이용 시간을 가르는 특징(연령, 직업 등)을 짐작할 수 있습니다."])
-
-# ============================================================================
-# 탭 6: 다운로드
-# ============================================================================
-with tabs[6]:
     st.header("전처리된 데이터 내려받기")
     st.write("공백 정리·숫자형 변환·중복/결측 처리가 끝난 데이터입니다. 엑셀에서 한글이 깨지지 않도록 UTF-8(BOM)으로 저장됩니다.")
     d1, d2 = st.columns(2)
