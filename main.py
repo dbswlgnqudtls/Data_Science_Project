@@ -782,7 +782,7 @@ with tabs[5]:
             "몇 개 안 되는 점으로 모델을 만들고 검증하게 되어 결과가 매우 불안정합니다.",
             "3) 설명 변수로 쓸 수 있는 퍼센트 열은 수십 개인데 집단은 훨씬 적어, 모델이 우연한 패턴을 외워 버리는 과적합 위험이 큽니다. "
             "또 이용 시간대 비율은 평균 이용 시간을 거의 그대로 계산할 수 있는 값이라 '예측'이 아니라 '순환 논리'가 됩니다.",
-            "**대신 할 수 있는 것**: 2~4번 탭처럼 집단별 평균을 비교하고 상관관계를 살펴보는 **기술 분석**은 타당합니다.",
+            "**대신 할 수 있는 것**: 집단별 평균을 비교하고 상관관계를 살펴보는 **기술 분석**은 타당합니다. 아래에서 확인해 보세요.",
             "**모델을 만들려면**: ① 개인 단위 응답 자료, 또는 ② 같은 기준·같은 모집단으로 집계된 집단이 최소 "
             f"{MIN_ROWS_FOR_MODEL}개 이상인 자료가 필요합니다.",
         ])
@@ -858,6 +858,93 @@ with tabs[5]:
                     ])
                 except Exception as e:
                     st.error(f"모델을 만드는 중 문제가 발생했습니다: {e}")
+
+    # --- 모델 대신 하는 기술 분석 ---
+    st.markdown("---")
+    st.subheader("기술 분석: 집단별 평균 비교와 상관관계")
+    st.markdown(
+        "예측 모델 대신, 집단들의 **평균 이용 시간이 어떤 특징과 함께 움직이는지**를 살펴봅니다. "
+        "이것은 미래나 개인을 예측하는 것이 아니라, 이 자료에 나타난 집단 간 **경향을 설명**하는 분석입니다."
+    )
+
+    def short_name(c):
+        return c.replace(" (퍼센트)", "").replace(" (분)", "").replace(" (명)", "")
+
+    use_time_cols = st.checkbox("이용 시간대 비율도 포함하기 (평균 이용 시간과 거의 같은 정보라 기본은 제외)", value=False, key="q5_time")
+    time_set = {c for c, _, _ in TIME_AVAILABLE}
+    skip = {AVG, NCOL, "집단"} | (set() if use_time_cols else time_set)
+    var_cols = [c for c in analysis.columns if pd.api.types.is_numeric_dtype(analysis[c]) and c not in skip]
+
+    rows = []
+    for c in var_cols:
+        r = safe_corr(analysis[c], analysis[AVG])
+        if r:
+            rows.append({"변수": short_name(c), "열": c, "피어슨 r": r["pearson"], "스피어만 ρ": r["spearman"], "집단 수": r["n"]})
+
+    if not rows:
+        st.warning("상관관계를 계산할 수 있는 변수가 없습니다.")
+    else:
+        cdf = pd.DataFrame(rows)
+        cdf["강도"] = cdf["피어슨 r"].abs()
+        cdf = cdf.sort_values("강도", ascending=False).reset_index(drop=True)
+        top_n = cdf.head(12).sort_values("피어슨 r")
+        top_n["방향"] = np.where(top_n["피어슨 r"] >= 0, "양(+)의 관계", "음(-)의 관계")
+        fig = px.bar(top_n, x="피어슨 r", y="변수", orientation="h", color="방향",
+                     text=top_n["피어슨 r"].round(2),
+                     labels={"피어슨 r": "평균 이용 시간과의 상관계수 (-1 ~ +1)"},
+                     title="평균 이용 시간과 관계가 큰 변수 (상위 12개)")
+        fig.update_traces(textposition="outside")
+        fig.update_xaxes(range=[-1.15, 1.15])
+        show_fig(fig)
+
+        pos = cdf[cdf["피어슨 r"] > 0].head(3)
+        neg = cdf[cdf["피어슨 r"] < 0].head(3)
+        lines = [f"전체 {len(analysis)}개 집단을 놓고, 각 변수가 높은 집단일수록 평균 이용 시간이 길어지는지(+) 짧아지는지(-)를 계산했습니다."]
+        if len(pos):
+            lines.append("평균 이용 시간이 **긴 집단일수록 높게 나타나는** 특징: " +
+                         ", ".join(f"{r['변수']}(r={r['피어슨 r']:.2f})" for _, r in pos.iterrows()))
+        if len(neg):
+            lines.append("평균 이용 시간이 **긴 집단일수록 낮게 나타나는** 특징: " +
+                         ", ".join(f"{r['변수']}(r={r['피어슨 r']:.2f})" for _, r in neg.iterrows()))
+        lines.append("상관관계는 '함께 변하는 정도'일 뿐 원인을 뜻하지 않습니다. 또 연령·직업·학력 집단은 서로 겹치는 사람들을 포함하므로, "
+                     "숫자는 정확한 값이 아니라 **경향을 보는 참고용**입니다. (젊은 집단이 여러 활동을 많이 하면서 이용 시간도 길어서, "
+                     "'연령'이라는 공통 요인이 여러 변수를 함께 움직였을 가능성이 큽니다.)")
+        interpret(lines)
+
+        show_df(cdf[["변수", "피어슨 r", "스피어만 ρ", "집단 수"]].round(3))
+
+        st.markdown("**변수를 골라 산점도로 보기**")
+        names = list(cdf["변수"])
+        pick_name = st.selectbox("변수 선택", names, index=0, key="q5_var")
+        pick_col = cdf.loc[cdf["변수"] == pick_name, "열"].iloc[0]
+        fig = px.scatter(analysis, x=pick_col, y=AVG, hover_name="집단", color=G1,
+                         labels={pick_col: pick_name, AVG: "하루 평균 이용 시간(분)", G1: "집계 기준"},
+                         title=f"{pick_name} vs 평균 이용 시간")
+        add_fit_line(fig, analysis[pick_col], analysis[AVG])
+        show_fig(fig)
+        rr = safe_corr(analysis[pick_col], analysis[AVG])
+        if rr:
+            way = "길어지는" if rr["pearson"] > 0 else "짧아지는"
+            interpret(f"'{pick_name}' 값이 큰 집단일수록 평균 이용 시간이 {way} 경향이 있으며, "
+                      f"피어슨 r = {rr['pearson']:.2f}, 스피어만 ρ = {rr['spearman']:.2f}로 {corr_strength(rr['pearson'])} 관계입니다.")
+
+    st.markdown("**평균 이용 시간이 가장 긴 집단과 가장 짧은 집단**")
+    k = min(8, len(analysis) // 2)
+    if k >= 1:
+        ranked = analysis.sort_values(AVG, ascending=False)
+        top_g, bot_g = ranked.head(k).copy(), ranked.tail(k).copy()
+        top_g["구분"], bot_g["구분"] = "긴 집단", "짧은 집단"
+        both = pd.concat([top_g, bot_g])
+        fig = px.bar(both, x=AVG, y="집단", orientation="h", color="구분", text=both[AVG].round(1),
+                     category_orders={"집단": list(both["집단"])},
+                     labels={AVG: "하루 평균 이용 시간(분)"}, title=f"평균 이용 시간 상위 {k}개와 하위 {k}개 집단")
+        fig.update_traces(textposition="outside")
+        fig.update_yaxes(autorange="reversed")
+        show_fig(fig)
+        t1, b1 = ranked.iloc[0], ranked.iloc[-1]
+        interpret([f"가장 긴 집단은 **{t1['집단']}**({fmt_min(t1[AVG])}), 가장 짧은 집단은 **{b1['집단']}**({fmt_min(b1[AVG])})이고 "
+                   f"차이는 {t1[AVG] - b1[AVG]:.1f}분입니다.",
+                   "상위·하위에 어떤 집단이 모이는지 보면, 평균 이용 시간을 가르는 특징(연령, 직업 등)을 짐작할 수 있습니다."])
 
 # ============================================================================
 # 탭 6: 다운로드
