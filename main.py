@@ -321,7 +321,7 @@ st.sidebar.markdown("---")
 st.sidebar.caption(f"불러온 파일: {source_name} (인코딩: {log['encoding']})")
 
 tabs = st.tabs(["데이터 확인", "1. 연령대별 이용 시간", "2. 이용 시간대 비율", "3. 콘텐츠 이용 빈도",
-                "4. 집단 특성 비교", "다운로드"])
+                "4. 집단 특성 비교", "5. 머신러닝 모델 평가", "다운로드"])
 
 # ============================================================================
 # 탭 0: 데이터 확인
@@ -727,9 +727,270 @@ with tabs[4]:
                 interpret(msg + ["순위상관은 '순서대로 갈수록 한 방향으로 변하는가'를 보는 값이라, 중간에 오르내림이 있으면 값이 작아질 수 있습니다."])
 
 # ============================================================================
-# 탭 5: 다운로드
+# 탭 5: 머신러닝 모델 평가 (분류: 집단의 평균 이용 시간이 '높음'인가 '낮음'인가)
 # ============================================================================
+ML_CLASS_NAMES = ["낮음", "높음"]
+ML_BASELINE = "기준선(다수 클래스로만 예측)"
+
+
+def ml_model_factories():
+    """평가할 모델 목록. 행이 적고 특성이 숫자 몇 개뿐이므로 단순한 모델 위주로 구성."""
+    from sklearn.dummy import DummyClassifier
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.tree import DecisionTreeClassifier
+
+    return {
+        "로지스틱 회귀": lambda: make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=1000)),
+        "의사결정나무(깊이 3)": lambda: DecisionTreeClassifier(max_depth=3, random_state=0),
+        "랜덤 포레스트(깊이 3)": lambda: RandomForestClassifier(n_estimators=200, max_depth=3, random_state=0),
+        ML_BASELINE: lambda: DummyClassifier(strategy="most_frequent"),
+    }
+
+
+def ml_cv_predict(factory, X, y, splits):
+    """교차검증: 각 행은 자신이 테스트로 빠진 학습에서 나온 예측값만 받는다."""
+    pred = np.full(len(y), -1, dtype=int)
+    for tr, te in splits:
+        if len(np.unique(y[tr])) < 2:  # 학습 데이터에 한 종류만 있으면 그 종류로 예측
+            pred[te] = y[tr][0]
+            continue
+        model = factory().fit(X[tr], y[tr])
+        pred[te] = model.predict(X[te])
+    return pred
+
+
+def ml_cls_metrics(y, pred):
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+    return {
+        "정확도": float(accuracy_score(y, pred)),
+        "정밀도": float(precision_score(y, pred, pos_label=1, zero_division=0)),
+        "재현율": float(recall_score(y, pred, pos_label=1, zero_division=0)),
+        "F1 점수": float(f1_score(y, pred, pos_label=1, zero_division=0)),
+    }
+
+
+def build_ml_features(df):
+    """예측에 쓸 특성: 스마트폰 이용률 + 콘텐츠별 '주간 이용일(근사)'.
+    이용 시간대 비율·평균이용시간은 정답을 거의 그대로 담고 있어 입력에서 제외한다."""
+    F = pd.DataFrame(index=df.index)
+    if USE:
+        F["스마트폰 이용률(%)"] = df[USE].astype(float)
+    contents = dict(FREQ_COLS)
+    tv_items = [(lab, find_col(cols, f"TV시청 {lab} (퍼센트)")) for lab in FREQ_ORDER]
+    tv_items = [(lab, c) for lab, c in tv_items if c]
+    if len(tv_items) >= 3:
+        contents["TV시청"] = tv_items
+    for p, items in contents.items():
+        name = f"{CONTENT_NAME.get(p, 'TV 시청')} 주간 이용일(근사)"
+        F[name] = sum(df[c].astype(float) / 100 * FREQ_DAYS[lab] for lab, c in items)
+    return F
+
+
+def render_ml_tab():
+    st.header("질문 5. 머신러닝 모델 평가: 집단의 평균 이용 시간이 '높은지·낮은지' 분류하기")
+    st.markdown(
+        "정확도·정밀도·재현율·F1 점수는 **분류 모델**을 평가하는 지표입니다. 그래서 평균 이용 시간 자체를 맞히는 대신, "
+        "**집단의 평균 이용 시간이 중앙값 이상이면 '높음', 미만이면 '낮음'** 으로 나누고 이를 맞히는 모델을 평가합니다. "
+        "입력(특성)은 스마트폰 이용률과 TV·OTT·뉴스정보검색·SNS및메신저의 이용 빈도 점수입니다."
+    )
+    st.warning("이 모델은 **집단별 평균**이 높은지 낮은지를 어림하는 탐색용 모델입니다. 한 사람 한 사람의 이용 시간을 예측하는 모델이 아닙니다.")
+
+    feats_all = build_ml_features(analysis)
+    if feats_all.shape[1] == 0:
+        st.warning("예측에 쓸 수 있는 특성을 찾지 못해 모델을 평가할 수 없습니다.")
+        return
+    keep = feats_all.notna().all(axis=1) & analysis[AVG].notna()
+    d = analysis[keep].copy()
+    feats = feats_all.loc[d.index]
+    n = len(d)
+    if n < 10:
+        st.warning(f"분석할 집단이 {n}개뿐이라 평가할 수 없습니다.")
+        return
+    med = float(d[AVG].median())
+    y = (d[AVG].to_numpy(dtype=float) >= med).astype(int)
+    if y.sum() < 3 or (n - y.sum()) < 3:
+        st.warning("'높음' 또는 '낮음' 집단이 3개 미만이라 평가할 수 없습니다.")
+        return
+    X = feats.to_numpy(dtype=float)
+
+    from sklearn.model_selection import GroupKFold
+
+    groups = d[G1].astype(str).to_numpy()
+    k = min(5, len(np.unique(groups)))
+    if k < 3:
+        st.warning("집계 기준(구분1)이 3개 미만이라 구분 단위 교차검증을 할 수 없습니다.")
+        return
+    splits = list(GroupKFold(n_splits=k).split(X, y, groups))
+
+    st.subheader("1) 평가 방법")
+    st.markdown(
+        f"**모델 선택 이유:** 행이 {n}개로 적고 특성이 {feats.shape[1]}개의 숫자뿐이며 서로 비슷하게 움직이는 것이 많아서, "
+        "복잡한 모델보다 **단순하고 안정적인 로지스틱 회귀**를 기본 모델로 권합니다. 의사결정나무와 랜덤 포레스트는 비교용이고, "
+        "아무것도 학습하지 않은 **기준선**과 비교해 모델이 실제로 도움이 되는지 확인합니다.  \n"
+        f"**'높음'의 기준:** 평균 이용 시간 **{med:.1f}분**(중앙값) 이상. 높음 {int(y.sum())}개, 낮음 {int(n - y.sum())}개 집단입니다.  \n"
+        f"**사용한 특성:** {', '.join(feats.columns)}"
+    )
+    st.info(
+        f"모든 집계 기준(성별, 연령, 직업 등)의 집단 {n}개를 합쳐 평가합니다. 집단 수가 적고 같은 응답자가 여러 기준에 겹쳐 있어서, "
+        "이 결과는 분류 모델 평가 방법을 익히기 위한 **탐색용**으로 봐 주세요. 평가는 **구분 단위 교차검증**으로 했습니다. "
+        "성별 행 전체, 연령 행 전체처럼 한 구분을 통째로 테스트에 쓰고 나머지로 학습하므로, 같은 구분의 행이 학습과 테스트에 섞이지 않습니다."
+    )
+
+    factories = ml_model_factories()
+    results, errors = {}, []
+    for name, fac in factories.items():
+        try:
+            pred = ml_cv_predict(fac, X, y, splits)
+            results[name] = dict(pred=pred, **ml_cls_metrics(y, pred))
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    for msg in errors:
+        st.warning(f"모델 평가 중 문제가 생겨 건너뛰었습니다 → {msg}")
+    models = [m for m in results if m != ML_BASELINE]
+    if not models:
+        st.error("평가할 수 있는 모델이 없습니다.")
+        return
+    metric_names = ["정확도", "정밀도", "재현율", "F1 점수"]
+
+    # ---- 2) 성능 표
+    st.subheader("2) 모델별 성능 지표 (표)")
+    st.markdown(
+        "- **정확도**: 전체 집단 중 '높음/낮음'을 맞힌 비율\n"
+        "- **정밀도**: 모델이 '높음'이라고 한 집단 중 실제로 '높음'인 비율 (잘못된 '높음' 판정이 적을수록 높음)\n"
+        "- **재현율**: 실제 '높음' 집단 중 모델이 찾아낸 비율 (놓친 것이 적을수록 높음)\n"
+        "- **F1 점수**: 정밀도와 재현율을 함께 보는 점수 (둘이 모두 높아야 높음)"
+    )
+    table = pd.DataFrame([{"모델": m, **{kk: round(results[m][kk], 3) for kk in metric_names}} for m in results])
+    show_df(table)
+
+    best = max(models, key=lambda m: (results[m]["F1 점수"], results[m]["정확도"]))
+    b, base = results[best], results.get(ML_BASELINE)
+    lines = [
+        f"F1 점수가 가장 높은 모델은 **{best}** 입니다. 정확도 **{b['정확도'] * 100:.1f}%**, 정밀도 **{b['정밀도']:.2f}**, "
+        f"재현율 **{b['재현율']:.2f}**, F1 **{b['F1 점수']:.2f}** 입니다."
+    ]
+    if base is not None:
+        gap = b["정확도"] - base["정확도"]
+        if gap > 0.1:
+            lines.append(
+                f"항상 다수 클래스로만 찍는 기준선의 정확도는 {base['정확도'] * 100:.1f}%입니다. {best}가 약 {gap * 100:.0f}%p 더 높아 "
+                "특성이 평균 이용 시간의 높고 낮음을 가려내는 데 어느 정도 도움이 되는 것으로 보입니다."
+            )
+        else:
+            lines.append(
+                f"항상 다수 클래스로만 찍는 기준선의 정확도는 {base['정확도'] * 100:.1f}%로, {best}와 큰 차이가 없습니다. "
+                "이 특성들로는 모델이 기준선보다 확실히 낫다고 말하기 어렵습니다."
+            )
+    if b["정밀도"] > b["재현율"] + 0.1:
+        lines.append("정밀도가 재현율보다 높아, '높음'이라고 할 때는 믿을 만하지만 실제 '높음' 집단을 일부 놓치는 편입니다.")
+    elif b["재현율"] > b["정밀도"] + 0.1:
+        lines.append("재현율이 정밀도보다 높아, 실제 '높음' 집단은 잘 찾지만 '낮음' 집단을 '높음'으로 잘못 부르는 경우가 섞여 있습니다.")
+    else:
+        lines.append("정밀도와 재현율이 비슷해서, 한쪽으로 치우치지 않고 균형 있게 분류하고 있습니다.")
+    lines.append("집단이 적고 같은 응답자가 겹쳐 있어, 이 점수는 실제 성능보다 좋게 나왔을 수 있는 탐색용 결과입니다.")
+    interpret(lines)
+
+    # ---- 3) 성능 그래프
+    st.subheader("3) 모델별 성능 지표 (그래프)")
+    palette = ["#4C78A8", "#F58518", "#54A24B", "#9AA0A6"]
+    figm = go.Figure()
+    for i, m in enumerate(results):
+        figm.add_trace(go.Bar(
+            name=m, x=metric_names, y=[results[m][kk] for kk in metric_names], marker_color=palette[i % len(palette)],
+            text=[f"{results[m][kk]:.2f}" for kk in metric_names], textposition="outside",
+        ))
+    figm.update_layout(
+        barmode="group", title="모델별 정확도·정밀도·재현율·F1 점수", xaxis_title="평가 지표",
+        yaxis_title="점수(0~1)", yaxis_range=[0, 1.15], legend=dict(orientation="h", y=-0.25),
+    )
+    show_fig(figm)
+    ordered = sorted(models, key=lambda m: -results[m]["F1 점수"])
+    gtxt = f"F1 점수 기준 순위는 {' > '.join(ordered)} 입니다. "
+    if len(ordered) >= 2 and results[ordered[0]]["F1 점수"] - results[ordered[-1]]["F1 점수"] < 0.05:
+        gtxt += "모델 사이의 차이가 작아서, 어떤 모델을 쓰든 결과가 비슷합니다. 이럴 때는 설명하기 쉬운 단순한 모델이 더 좋은 선택입니다."
+    else:
+        gtxt += "모델에 따라 성능 차이가 있습니다. 회색 막대(기준선)보다 높아야 모델이 의미 있게 학습한 것입니다."
+    interpret(gtxt)
+
+    # ---- 4) 혼동행렬
+    st.subheader("4) 어디에서 틀렸는지 보기 (혼동행렬)")
+    pick = st.selectbox("살펴볼 모델", models, index=models.index(best), key="ml_cm_model")
+    from sklearn.metrics import confusion_matrix
+
+    pred = results[pick]["pred"]
+    cm = confusion_matrix(y, pred, labels=[0, 1])
+    figcm = go.Figure(go.Heatmap(
+        z=cm, x=[f"예측: {c}" for c in ML_CLASS_NAMES], y=[f"실제: {c}" for c in ML_CLASS_NAMES],
+        text=cm.astype(str), texttemplate="%{text}", colorscale="Blues", showscale=False,
+    ))
+    figcm.update_layout(title=f"{pick}의 혼동행렬", yaxis_autorange="reversed")
+    show_fig(figcm)
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+    interpret(
+        f"실제로 '높음'인 집단 {tp + fn}개 중 **{tp}개**를 '높음'으로 맞혔고 **{fn}개**는 '낮음'으로 잘못 판단했습니다. "
+        f"실제로 '낮음'인 집단 {tn + fp}개 중 **{tn}개**를 맞혔고 **{fp}개**는 '높음'으로 잘못 판단했습니다. "
+        "대각선(왼쪽 위, 오른쪽 아래) 숫자가 클수록 잘 맞힌 것입니다."
+    )
+    wrong = d.assign(_pred=pred, _y=y)
+    wrong = wrong[wrong["_pred"] != wrong["_y"]]
+    if len(wrong):
+        with st.expander(f"잘못 분류된 집단 {len(wrong)}개 보기"):
+            show_df(pd.DataFrame({
+                "집단": wrong["집단"].to_numpy(),
+                "평균 이용시간(분)": wrong[AVG].round(1).to_numpy(),
+                "실제": [ML_CLASS_NAMES[v] for v in wrong["_y"]],
+                "예측": [ML_CLASS_NAMES[v] for v in wrong["_pred"]],
+            }))
+
+    # ---- 5) 특성 중요도
+    st.subheader("5) 모델이 어떤 특성을 중요하게 봤을까?")
+    try:
+        full = factories[pick]().fit(X, y)
+        last = full[-1] if hasattr(full, "steps") else full
+        imp, signed = None, None
+        if hasattr(last, "coef_"):
+            signed = pd.Series(last.coef_[0], index=feats.columns)
+            imp = signed.abs()
+            title, xlab = "특성별 영향력 (표준화 계수의 크기)", "영향력(절댓값)"
+        elif hasattr(last, "feature_importances_"):
+            imp = pd.Series(last.feature_importances_, index=feats.columns)
+            title, xlab = "특성별 중요도", "중요도(합계 1)"
+        if imp is not None and imp.sum() > 0:
+            imp = imp.sort_values()
+            figi = go.Figure(go.Bar(
+                x=imp.values, y=imp.index, orientation="h", marker_color="#4C78A8",
+                text=[f"{v:.2f}" for v in imp.values], textposition="outside",
+            ))
+            figi.update_layout(title=f"{pick}: {title}", xaxis_title=xlab, yaxis_title="", showlegend=False,
+                               height=max(320, 45 * len(imp) + 140))
+            show_fig(figi)
+            top_f = imp.index[-1]
+            txt = f"{pick}이(가) 높고 낮음을 가를 때 가장 크게 참고한 특성은 **{top_f}** 입니다. "
+            if signed is not None:
+                txt += f"이 특성 값이 클수록 '{'높음' if signed[top_f] > 0 else '낮음'}'으로 분류하는 쪽으로 작용했습니다. "
+            txt += ("이 그림은 전체 자료로 다시 학습해 그린 설명용 그래프이며, 특성들끼리 서로 비슷하게 움직이는 경우가 많아 "
+                    "하나하나의 영향을 정확히 나눠 말하기는 어렵습니다.")
+            interpret(txt)
+        else:
+            st.caption("이 모델은 특성 중요도를 제공하지 않습니다.")
+    except Exception as e:
+        st.caption(f"특성 중요도를 계산하지 못했습니다. ({e})")
+
+
 with tabs[5]:
+    try:
+        render_ml_tab()
+    except Exception as e:
+        st.error(f"모델 평가 중 문제가 발생했습니다: {e}")
+
+# ============================================================================
+# 탭 6: 다운로드
+# ============================================================================
+with tabs[6]:
     st.header("전처리된 데이터 내려받기")
     st.write("공백 정리·숫자형 변환·중복/결측 처리가 끝난 데이터입니다. 엑셀에서 한글이 깨지지 않도록 UTF-8(BOM)으로 저장됩니다.")
     d1, d2 = st.columns(2)
